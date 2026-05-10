@@ -1,2 +1,2 @@
 # VulnProbe
-XSS - CSRF - SQLI - Information Leak 
+VulnProbe is a vulnerability scanner that is able to scan SQL injection, XSS, CSRF, and Information leak
